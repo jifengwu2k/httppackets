@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "httppackets"
-version = "0.1.0a0"
+version = "0.1.0a1"
 description = "Streaming, callback-based parsers and serializers for HTTP/1.1 requests and responses."
 readme = "README.md"
 requires-python = ">=2"
@@ -19,7 +19,8 @@ classifiers = [
 ]
 dependencies = [
     "enum34; python_version < '3.4'",
-    "lark",
+    "lark<=0.12.0; python_version < '3'",
+    "lark; python_version >= '3'",
     "six",
     "typing; python_version < '3.5'",
 ]

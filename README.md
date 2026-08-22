@@ -11,7 +11,7 @@ Streaming, callback-based parsers and serializers for HTTP/1.1 requests and resp
 - **Callback-based parsing API** — separate callbacks for header decisions and body consumption.
 - **Push-based serialization API** — feed structured data, get well-formed HTTP/1.1 bytes out.
 - **Strict protocol checks** — rejects folded headers, conflicting framing, and unrecognised transfer codings.
-- **Body framing** — supports `Content-Length`, `Transfer-Encoding: chunked`, and no-body messages.
+- **Body framing** — supports `Content-Length`, `Transfer-Encoding: chunked`, close-delimited response bodies, and no-body messages.
 - **Typed errors** — every protocol-level failure is a distinct error subclass.
 - **Highly readable code** — plain, linear, imperative Python with no magic; easy to understand, audit, and port to other languages.
 
@@ -151,7 +151,7 @@ print(out.getvalue())
 Output:
 
 ```
-b'POST /upload HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\n\r\nb\r\nchunk one\r\n\r\nb\r\nchunk two\r\n\r\nc\r\nfinal chunk\r\n0\r\n\r\n'
+b'POST /upload HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\n\r\nb\r\nchunk one\r\n\r\nb\r\nchunk two\r\n\r\nb\r\nfinal chunk\r\n0\r\n\r\n'
 ```
 
 ### Parse HTTP/1.1 responses
@@ -243,15 +243,18 @@ Parse HTTP/1.1 requests from `stream` until clean EOF or a `ParserError` is rais
 
 ### `http_1_1_parser` — Response parsing
 
-#### `parse_http_1_1_responses(stream, *, on_headers, on_body)`
+#### `parse_http_1_1_responses(stream, on_headers, on_body, request_methods=None)`
 
 Parse HTTP/1.1 responses from `stream` until clean EOF or a `ParserError` is raised.
 
-| Parameter    | Type                                            | Description                                                         |
-| ------------ | ----------------------------------------------- | ------------------------------------------------------------------- |
-| `stream`     | `BinaryIO`                                      | Source of raw HTTP bytes.                                           |
-| `on_headers` | `(status_code, reason, headers) -> Decision`    | Called when headers are complete. `status_code` is `int`, `reason` is `str`, header names/values are `str`. |
-| `on_body`    | `(reader) -> None`                              | Called for responses with a body. Must drain the reader fully.      |
+| Parameter         | Type                                            | Description                                                         |
+| ----------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
+| `stream`          | `BinaryIO`                                      | Source of raw HTTP bytes.                                           |
+| `on_headers`      | `(status_code, reason, headers) -> Decision`    | Called when headers are complete. `status_code` is `int`, `reason` is `str`, header names/values are `str`. |
+| `on_body`         | `(reader) -> None`                              | Called for responses with a body. Must drain the reader fully.      |
+| `request_methods` | `Optional[Sequence[str]]`                       | One method per final response. Supply this when parsing responses to `HEAD` or `CONNECT`; informational responses reuse the current method. |
+
+Responses without `Content-Length` or `Transfer-Encoding` are read as close-delimited bodies. `1xx`, `204`, and `304` responses never have message bodies. When `request_methods` identifies a response to `HEAD`, framing headers describe the hypothetical GET response and no body is read. A successful `CONNECT` response and a `101 Switching Protocols` response stop HTTP parsing while leaving tunnel/protocol bytes unread.
 
 ### `http_1_1_serializer` — Request & response writing
 
@@ -267,6 +270,8 @@ Write a single HTTP/1.1 request to `stream`.
 | `headers`  | `Dict[str, List[str]]`                        | Header fields. Names are case-insensitive; values are joined per RFC 7230.|
 | `body`     | `Optional[Union[bytes, SupportsRead]]`        | `None` for no body, `bytes` for Content-Length framing, `SupportsRead` for chunked encoding. |
 
+> **Framing headers are managed by the serializer.** When `body` is `bytes` or `SupportsRead`, do **not** include a `Content-Length` or `Transfer-Encoding` header in `headers` (any casing) — the serializer adds the correct one and raises `ConflictingFramingError` if you set your own. Header names must be non-empty RFC 7230 tokens; a name containing forbidden characters raises `HeaderValueError`.
+
 #### `serialize_http_1_1_response(stream, status_code, reason, headers, body=None)`
 
 Write a single HTTP/1.1 response to `stream`.
@@ -278,6 +283,14 @@ Write a single HTTP/1.1 response to `stream`.
 | `reason`      | `str`                                         | Reason phrase (e.g. `"OK"`, `"Not Found"`).                               |
 | `headers`     | `Dict[str, List[str]]`                        | Header fields.                                                            |
 | `body`        | `Optional[Union[bytes, SupportsRead]]`        | `None` for no body, `bytes` for Content-Length framing, `SupportsRead` for chunked encoding. |
+
+### Text and bytes
+
+Header names and values, the request `method` and `target`, and the response `reason` are **text strings** — `str` on Python 3, `unicode` on Python 2.
+
+- **Parsing** always returns text. Bytes `0x80`–`0xFF` in request targets, reason phrases, and header values are preserved by decoding as latin-1, so the same input yields the same text on Python 2 and Python 3.
+- **Serialization** accepts either text or `bytes` for these fields. `bytes` is decoded as latin-1, so a given value produces byte-for-byte identical output on both Python versions.
+- **Validation** rejects malformed start lines, invalid status codes, forbidden field-name characters, control characters in field values, and CRLF injection before writing any bytes.
 
 #### `SupportsRead` (abstract base)
 
@@ -304,7 +317,7 @@ Controls what happens after headers have been parsed (shared by both parsers).
 | `REJECT`       | Stop parsing cleanly without reading the body.                            |
 | `ABORT`        | Stop parsing cleanly without reading the body.                            |
 
-> **Note:** For methods that carry no body (GET, HEAD, DELETE without a body, etc.) and for responses that carry no body (1xx, 204, 304, etc.) the parsers correctly treat the message as having no body, regardless of which `Decision` is returned.
+> **Note:** Request bodies are framed by their own `Content-Length` or `Transfer-Encoding` headers; a request with neither has no body. Response framing additionally uses the status code and, when supplied, the corresponding entry in `request_methods`.
 
 ### Error hierarchy
 
@@ -318,10 +331,14 @@ All parser errors inherit from `ParserError(Exception)` (shared by both parsers)
 - `UnsupportedTransferEncoding` — a `Transfer-Encoding` other than `chunked`.
 - `PrematureEOF` — stream ended before a message was complete.
 - `BodyNotConsumedError` — `on_body` returned without draining the entire body.
+- `LineTooLong` — a start line, header line, chunk-size line, or trailer exceeds 8,192 bytes.
+- `HeaderSectionTooLarge` — a header or trailer section exceeds 65,536 bytes.
 
-Serialization errors:
+Serialization errors (all inherit from `SerializerError(Exception)`):
 
-- `HeaderValueError` — a header name or value contains forbidden characters (e.g. embedded CRLF).
+- `HeaderValueError` — a header name is empty or contains a non-token character, or a header value contains forbidden control characters.
+- `ConflictingFramingError` — the caller set a `Content-Length` or `Transfer-Encoding` header on a body-bearing message; the serializer manages framing itself.
+- `StartLineValueError` — a method, request target, status code, or reason phrase cannot be serialized as a valid HTTP/1.1 start line.
 
 ## Limitations
 
@@ -329,7 +346,18 @@ Serialization errors:
 - **Strict parsing** — obsolete constructs like line folding and bare `\n` are treated as errors.
 - **No framing renegotiation** — transfer codings other than `chunked` are unsupported.
 - **Trailer headers in chunked bodies** — they are parsed and validated but discarded.
+- **Bounded metadata** — each HTTP line is limited to 8,192 bytes and each header or trailer section to 65,536 bytes.
 - **Serialization produces chunked encoding for `SupportsRead` bodies** — Content-Length with a streaming body requires the caller to know the length ahead of time. Use `bytes` for that case.
+
+## Running the tests
+
+The test suite is a single self-contained script that runs unchanged on both Python 2 and Python 3 (and on POSIX and NT — it uses only in-memory streams and has no filesystem or network dependencies):
+
+```
+python tests.py
+```
+
+It exercises request and response parsing, serialization, body framing (`Content-Length`, chunked, close-delimited, and no body), line and header limits, strict chunk extensions, response request context, the full error hierarchy, non-ASCII (latin-1) round-trips, and cross-version output stability. The process prints one line per test and exits non-zero if any test fails.
 
 ## Contributing
 

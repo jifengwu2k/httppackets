@@ -2,6 +2,7 @@
 # Licensed under the MIT License. See LICENSE file in the project root
 # for full license information.
 import six
+from six import text_type
 from enum import Enum
 
 from typing import (
@@ -43,8 +44,9 @@ class BodyReader(object):
 
 
 class ParserError(Exception):
-    __slots__ = ()
     """Base class for protocol-level parser failures."""
+
+    __slots__ = ()
 
 
 class MalformedRequestLine(ParserError):
@@ -75,7 +77,15 @@ class PrematureEOF(ParserError):
     __slots__ = ()
 
 
-class BodyNotConsumedError(RuntimeError):
+class BodyNotConsumedError(ParserError):
+    __slots__ = ()
+
+
+class LineTooLong(ParserError):
+    __slots__ = ()
+
+
+class HeaderSectionTooLarge(ParserError):
     __slots__ = ()
 
 
@@ -101,13 +111,14 @@ class BodyKind(Enum):
     NONE = 1
     CONTENT_LENGTH = 2
     CHUNKED = 3
+    CLOSE_DELIMITED = 4
 
 
 class RequestLine(object):
     __slots__ = ("method", "target", "version")
 
     def __init__(self, method, target, version):
-        # type: (str, str, str) -> None
+        # type: (text_type, text_type, text_type) -> None
         self.method = method
         self.target = target
         self.version = version
@@ -117,7 +128,7 @@ class StatusLine(object):
     __slots__ = ("version", "status_code", "reason")
 
     def __init__(self, version, status_code, reason):
-        # type: (str, int, str) -> None
+        # type: (text_type, int, text_type) -> None
         self.version = version
         self.status_code = status_code
         self.reason = reason
@@ -127,7 +138,7 @@ class HeaderField(object):
     __slots__ = ("name", "value")
 
     def __init__(self, name, value):
-        # type: (str, str) -> None
+        # type: (text_type, text_type) -> None
         self.name = name
         self.value = value
 
@@ -144,7 +155,7 @@ class RequestHead(object):
     __slots__ = ("method", "target", "headers", "body_kind", "body_length")
 
     def __init__(self, method, target, headers, body_kind, body_length=0):
-        # type: (str, str, Dict[str, List[str]], BodyKind, int) -> None
+        # type: (text_type, text_type, Dict[text_type, List[text_type]], BodyKind, int) -> None
         self.method = method
         self.target = target
         self.headers = headers
@@ -153,26 +164,40 @@ class RequestHead(object):
 
 
 class ResponseHead(object):
-    __slots__ = ("status_code", "reason", "headers", "body_kind", "body_length")
+    __slots__ = (
+        "status_code",
+        "reason",
+        "headers",
+        "body_kind",
+        "body_length",
+        "request_method",
+    )
 
-    def __init__(self, status_code, reason, headers, body_kind, body_length=0):
-        # type: (int, str, Dict[str, List[str]], BodyKind, int) -> None
+    def __init__(
+        self,
+        status_code,
+        reason,
+        headers,
+        body_kind,
+        body_length=0,
+        request_method=None,
+    ):
+        # type: (int, text_type, Dict[text_type, List[text_type]], BodyKind, int, Optional[text_type]) -> None
         self.status_code = status_code
         self.reason = reason
         self.headers = headers
         self.body_kind = body_kind
         self.body_length = body_length
+        self.request_method = request_method
 
 
 HTTP_GRAMMAR = r"""
     request_line: METHOD SP REQUEST_TARGET SP HTTP_VERSION CRLF
-    status_line: HTTP_VERSION SP STATUS_CODE SP REASON_PHRASE CRLF
+    status_line: HTTP_VERSION SP STATUS_CODE SP REASON_PHRASE? CRLF
     header_field: FIELD_NAME ":" HEADER_TAIL? CRLF
-    chunk_header: CHUNK_SIZE chunk_extension* CRLF
     transfer_encoding_value: ows TRANSFER_CODING (ows "," ows TRANSFER_CODING)* ows
     content_length_value: ows DIGITS (ows "," ows DIGITS)* ows
 
-    chunk_extension: ";" CHUNK_EXT_TEXT?
     ows: WS*
 
     METHOD: /[!#$%&'*+\-.^_`|~0-9A-Za-z]+/
@@ -181,10 +206,8 @@ HTTP_GRAMMAR = r"""
     REQUEST_TARGET: /[^\x00-\x20\x7f]+/
     HTTP_VERSION: /HTTP\/[0-9]\.[0-9]/
     HEADER_TAIL: /[\t\x20-\x7e\x80-\xff]+/
-    CHUNK_SIZE: /[0-9A-Fa-f]+/
-    CHUNK_EXT_TEXT: /[\t\x20-\x7e\x80-\xff]+/
     STATUS_CODE: /[0-9]{3}/
-    REASON_PHRASE: /[^\x00-\x1f\x7f]+/
+    REASON_PHRASE: /[\t\x20-\x7e\x80-\xff]+/
     DIGITS: /[0-9]+/
     CRLF: "\r\n"
     SP: " "
@@ -199,7 +222,6 @@ GRAMMAR_PARSER = Lark(
         "request_line",
         "status_line",
         "header_field",
-        "chunk_header",
         "transfer_encoding_value",
         "content_length_value",
     ],
@@ -207,8 +229,12 @@ GRAMMAR_PARSER = Lark(
 )
 
 
-def read_cr_lf_terminated_line(stream):
-    # type: (BinaryIO) -> Tuple[bool, bytearray]
+MAX_LINE_SIZE = 8192
+MAX_HEADER_SECTION_SIZE = 65536
+
+
+def read_cr_lf_terminated_line(stream, max_size=MAX_LINE_SIZE):
+    # type: (BinaryIO, int) -> Tuple[bool, bytearray]
     result = bytearray()
     state = ReadState.DATA
 
@@ -228,12 +254,17 @@ def read_cr_lf_terminated_line(stream):
                 return False, result
             elif chunk == b"\n":
                 result.extend(chunk)
+                if len(result) > max_size:
+                    raise LineTooLong("HTTP line exceeds %d bytes" % (max_size,))
                 return True, result
             elif chunk == b"\r":
                 result.extend(chunk)
             else:
                 result.extend(chunk)
                 state = ReadState.DATA
+
+        if len(result) > max_size:
+            raise LineTooLong("HTTP line exceeds %d bytes" % (max_size,))
 
 
 def read_exact(stream, n):
@@ -250,9 +281,9 @@ def read_exact(stream, n):
     return out
 
 
-def read_line(stream, eof_message):
-    # type: (BinaryIO, str) -> Optional[bytearray]
-    complete, line = read_cr_lf_terminated_line(stream)
+def read_line(stream, eof_message, max_size=MAX_LINE_SIZE):
+    # type: (BinaryIO, str, int) -> Optional[bytearray]
+    complete, line = read_cr_lf_terminated_line(stream, max_size=max_size)
     if complete:
         return line
     if not line:
@@ -288,9 +319,9 @@ def parse_request_line(line):
         error_type=MalformedRequestLine,
         message="malformed request line",
     )
-    method = str(grammar_tokens(tree, "METHOD")[0])
-    target = str(grammar_tokens(tree, "REQUEST_TARGET")[0])
-    version = str(grammar_tokens(tree, "HTTP_VERSION")[0])
+    method = text_type(grammar_tokens(tree, "METHOD")[0])
+    target = text_type(grammar_tokens(tree, "REQUEST_TARGET")[0])
+    version = text_type(grammar_tokens(tree, "HTTP_VERSION")[0])
     if version != "HTTP/1.1":
         raise UnsupportedHTTPVersion("only HTTP/1.1 requests are supported")
     return RequestLine(method=method, target=target, version=version)
@@ -304,9 +335,10 @@ def parse_status_line(line):
         error_type=MalformedStatusLine,
         message="malformed status line",
     )
-    version = str(grammar_tokens(tree, "HTTP_VERSION")[0])
-    status_code = int(str(grammar_tokens(tree, "STATUS_CODE")[0]))
-    reason = str(grammar_tokens(tree, "REASON_PHRASE")[0])
+    version = text_type(grammar_tokens(tree, "HTTP_VERSION")[0])
+    status_code = int(text_type(grammar_tokens(tree, "STATUS_CODE")[0]))
+    reason_tokens = grammar_tokens(tree, "REASON_PHRASE")
+    reason = text_type(reason_tokens[0]) if reason_tokens else u""
     if version != "HTTP/1.1":
         raise UnsupportedHTTPVersion("only HTTP/1.1 responses are supported")
     return StatusLine(version=version, status_code=status_code, reason=reason)
@@ -322,30 +354,97 @@ def parse_header_field(line):
         error_type=MalformedHeader,
         message="malformed header line",
     )
-    name = str(grammar_tokens(tree, "FIELD_NAME")[0]).lower()
+    name = text_type(grammar_tokens(tree, "FIELD_NAME")[0]).lower()
     value_tokens = grammar_tokens(tree, "HEADER_TAIL")
     if not value_tokens:
-        value = ""
+        value = u""
     else:
-        value = str(value_tokens[0]).strip(" \t")
+        value = text_type(value_tokens[0]).strip(u" \t")
     return HeaderField(name=name, value=value)
+
+
+TOKEN_BYTE_VALUES = frozenset(
+    bytearray(b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+)
+HEXADECIMAL_BYTE_VALUES = frozenset(bytearray(b"0123456789ABCDEFabcdef"))
 
 
 def parse_chunk_header(line):
     # type: (Union[bytes, bytearray]) -> ChunkHeader
-    tree = parse_grammar(
-        line,
-        start="chunk_header",
-        error_type=InvalidFraming,
-        message="invalid chunk size line",
-    )
-    size = int(str(grammar_tokens(tree, "CHUNK_SIZE")[0]), 16)
+    data = bytearray(line)
+    end = len(data) - 2
+    if end < 1 or data[end:] != bytearray(b"\r\n"):
+        raise InvalidFraming("invalid chunk size line")
+
+    position = 0
+    while position < end and data[position] in HEXADECIMAL_BYTE_VALUES:
+        position += 1
+    if position == 0:
+        raise InvalidFraming("invalid chunk size line")
+
+    size = int(bytes(data[:position]), 16)
+
+    while position < end:
+        if data[position] != ord(";"):
+            raise InvalidFraming("invalid chunk extension")
+        position += 1
+
+        name_start = position
+        while position < end and data[position] in TOKEN_BYTE_VALUES:
+            position += 1
+        if position == name_start:
+            raise InvalidFraming("invalid chunk extension name")
+
+        if position < end and data[position] == ord("="):
+            position += 1
+            if position >= end:
+                raise InvalidFraming("missing chunk extension value")
+
+            if data[position] == ord('"'):
+                position += 1
+                closed = False
+                while position < end:
+                    value = data[position]
+                    if value == ord('"'):
+                        position += 1
+                        closed = True
+                        break
+                    if value == ord("\\"):
+                        position += 1
+                        if position >= end:
+                            raise InvalidFraming("invalid quoted chunk extension")
+                        value = data[position]
+                        if not (
+                            value == 9
+                            or 32 <= value <= 126
+                            or 128 <= value <= 255
+                        ):
+                            raise InvalidFraming("invalid quoted chunk extension")
+                    elif not (
+                        value == 9
+                        or value == 32
+                        or value == 33
+                        or 35 <= value <= 91
+                        or 93 <= value <= 126
+                        or 128 <= value <= 255
+                    ):
+                        raise InvalidFraming("invalid quoted chunk extension")
+                    position += 1
+                if not closed:
+                    raise InvalidFraming("unterminated quoted chunk extension")
+            else:
+                value_start = position
+                while position < end and data[position] in TOKEN_BYTE_VALUES:
+                    position += 1
+                if position == value_start:
+                    raise InvalidFraming("invalid chunk extension value")
+
     return ChunkHeader(size=size)
 
 
 def parse_transfer_encoding(values):
-    # type: (Sequence[str]) -> List[str]
-    codings = []  # type: List[str]
+    # type: (Sequence[text_type]) -> List[text_type]
+    codings = []  # type: List[text_type]
     for raw_value in values:
         tree = parse_grammar(
             raw_value.encode("latin-1"),
@@ -354,13 +453,14 @@ def parse_transfer_encoding(values):
             message="invalid transfer-encoding value",
         )
         codings.extend(
-            str(token).lower() for token in grammar_tokens(tree, "TRANSFER_CODING")
+            text_type(token).lower()
+            for token in grammar_tokens(tree, "TRANSFER_CODING")
         )
     return codings
 
 
 def parse_content_length(values):
-    # type: (Sequence[str]) -> int
+    # type: (Sequence[text_type]) -> int
     lengths = []  # type: List[int]
     for raw_value in values:
         tree = parse_grammar(
@@ -369,7 +469,9 @@ def parse_content_length(values):
             error_type=InvalidFraming,
             message="invalid content-length value",
         )
-        lengths.extend(int(str(token)) for token in grammar_tokens(tree, "DIGITS"))
+        lengths.extend(
+            int(text_type(token)) for token in grammar_tokens(tree, "DIGITS")
+        )
 
     if not lengths:
         raise InvalidFraming("missing content-length value")
@@ -410,16 +512,50 @@ class ContentLengthBodyReader(BodyReader):
         return self.remaining == 0
 
 
+class CloseDelimitedBodyReader(BodyReader):
+    __slots__ = ("stream", "exhausted")
+
+    def __init__(self, stream):
+        # type: (BinaryIO) -> None
+        self.stream = stream
+        self.exhausted = False
+
+    def read(self, n=-1):
+        # type: (int) -> Union[bytes, bytearray]
+        if self.exhausted:
+            return b""
+        if n == 0:
+            return b""
+
+        data = self.stream.read(n)
+        if not data:
+            self.exhausted = True
+            return b""
+        if n is None or n < 0:
+            self.exhausted = True
+        return data
+
+    def is_exhausted(self):
+        # type: () -> bool
+        return self.exhausted
+
+
 class ChunkedBodyReader(BodyReader):
     """Decode a chunked request body behind a simple ``read()`` API."""
 
-    __slots__ = ("stream", "state", "chunk_remaining")
+    __slots__ = (
+        "stream",
+        "state",
+        "chunk_remaining",
+        "trailer_section_size",
+    )
 
     def __init__(self, stream):
         # type: (BinaryIO) -> None
         self.stream = stream
         self.state = ChunkedState.SIZE
         self.chunk_remaining = 0
+        self.trailer_section_size = 0
 
     def read(self, n=-1):
         # type: (int) -> Union[bytes, bytearray]
@@ -499,6 +635,12 @@ class ChunkedBodyReader(BodyReader):
             )
             if line is None:
                 raise PrematureEOF("unexpected EOF while reading chunked trailers")
+            self.trailer_section_size += len(line)
+            if self.trailer_section_size > MAX_HEADER_SECTION_SIZE:
+                raise HeaderSectionTooLarge(
+                    "trailer section exceeds %d bytes"
+                    % (MAX_HEADER_SECTION_SIZE,)
+                )
             if line == b"\r\n":
                 self.state = ChunkedState.DONE
                 return
@@ -506,9 +648,6 @@ class ChunkedBodyReader(BodyReader):
 
     def is_exhausted(self):
         # type: () -> bool
-        if self.state is ChunkedState.DONE:
-            return True
-        _ = self.read()
         return self.state is ChunkedState.DONE
 
 
@@ -521,18 +660,26 @@ def make_body_reader(stream, body_kind, body_length):
         return ContentLengthBodyReader(stream, body_length)
     elif body_kind is BodyKind.CHUNKED:
         return ChunkedBodyReader(stream)
+    elif body_kind is BodyKind.CLOSE_DELIMITED:
+        return CloseDelimitedBodyReader(stream)
     else:  # pragma: no cover
         raise AssertionError("unexpected body kind: %s" % (body_kind,))
 
 
 def read_headers(stream):
-    # type: (BinaryIO) -> Dict[str, List[str]]
-    headers = {}  # type: Dict[str, List[str]]
+    # type: (BinaryIO) -> Dict[text_type, List[text_type]]
+    headers = {}  # type: Dict[text_type, List[text_type]]
+    section_size = 0
 
     while True:
         line = read_line(stream, eof_message="unexpected EOF while reading headers")
         if line is None:
             raise PrematureEOF("unexpected EOF while reading headers")
+        section_size += len(line)
+        if section_size > MAX_HEADER_SECTION_SIZE:
+            raise HeaderSectionTooLarge(
+                "header section exceeds %d bytes" % (MAX_HEADER_SECTION_SIZE,)
+            )
         if line == b"\r\n":
             return headers
         field = parse_header_field(line)
@@ -540,7 +687,7 @@ def read_headers(stream):
 
 
 def determine_body(headers):
-    # type: (Dict[str, List[str]]) -> Tuple[BodyKind, int]
+    # type: (Dict[text_type, List[text_type]]) -> Tuple[BodyKind, int]
     has_te = "transfer-encoding" in headers
     has_cl = "content-length" in headers
 
@@ -566,6 +713,20 @@ def determine_body(headers):
     return BodyKind.NONE, 0
 
 
+def determine_response_body(headers, status_code, request_method):
+    # type: (Dict[text_type, List[text_type]], int, Optional[text_type]) -> Tuple[BodyKind, int]
+    if request_method == u"HEAD":
+        return BodyKind.NONE, 0
+    if request_method == u"CONNECT" and 200 <= status_code < 300:
+        return BodyKind.NONE, 0
+    if 100 <= status_code < 200 or status_code == 204 or status_code == 304:
+        return BodyKind.NONE, 0
+
+    if "transfer-encoding" not in headers and "content-length" not in headers:
+        return BodyKind.CLOSE_DELIMITED, 0
+    return determine_body(headers)
+
+
 def drain_body(reader):
     # type: (BodyReader) -> None
     while reader.read(BODY_CHUNK):
@@ -573,7 +734,7 @@ def drain_body(reader):
 
 
 def parse_http_1_1_requests(stream, on_headers, on_body):
-    # type: (BinaryIO, Callable[[str, str, Dict[str, List[str]]], Decision], Callable[[BodyReader], None]) -> None
+    # type: (BinaryIO, Callable[[text_type, text_type, Dict[text_type, List[text_type]]], Decision], Callable[[BodyReader], None]) -> None
     """Parse a stream of HTTP/1.1 requests sequentially.
 
     Clean EOF at a request boundary ends parsing normally.
@@ -667,18 +828,23 @@ def parse_http_1_1_requests(stream, on_headers, on_body):
             raise AssertionError("unexpected parser state: %s" % (state,))
 
 
-def parse_http_1_1_responses(stream, on_headers, on_body):
-    # type: (BinaryIO, Callable[[int, str, Dict[str, List[str]]], Decision], Callable[[BodyReader], None]) -> None
+def parse_http_1_1_responses(
+    stream, on_headers, on_body, request_methods=None
+):
+    # type: (BinaryIO, Callable[[int, text_type, Dict[text_type, List[text_type]]], Decision], Callable[[BodyReader], None], Optional[Sequence[text_type]]) -> None
     """Parse a stream of HTTP/1.1 responses sequentially.
 
     Clean EOF at a response boundary ends parsing normally.
     Protocol-level failures raise ``ParserError`` subclasses and terminate parsing.
     Callback failures from ``on_headers`` or ``on_body`` propagate as raised.
+    ``request_methods`` supplies one method for each final response, allowing
+    responses to HEAD and successful CONNECT requests to be framed correctly.
     """
 
     state = ParserState.STATUS_LINE
     current = None  # type: Optional[ResponseHead]
     body_reader = None  # type: Optional[BodyReader]
+    request_index = 0
 
     while state is not ParserState.DONE:
         if state is ParserState.STATUS_LINE:
@@ -690,25 +856,38 @@ def parse_http_1_1_responses(stream, on_headers, on_body):
                 continue
 
             status_line = parse_status_line(line)
+            request_method = None  # type: Optional[text_type]
+            if request_methods is not None:
+                if request_index >= len(request_methods):
+                    raise ValueError(
+                        "request_methods has no entry for response %d"
+                        % (request_index,)
+                    )
+                request_method = request_methods[request_index]
+
             current = ResponseHead(
                 status_code=status_line.status_code,
                 reason=status_line.reason,
                 headers={},
                 body_kind=BodyKind.NONE,
                 body_length=0,
+                request_method=request_method,
             )
             state = ParserState.HEADERS
 
         elif state is ParserState.HEADERS:
             assert current is not None
             headers = read_headers(stream)
-            body_kind, body_length = determine_body(headers)
+            body_kind, body_length = determine_response_body(
+                headers, current.status_code, current.request_method
+            )
             current = ResponseHead(
                 status_code=current.status_code,
                 reason=current.reason,
                 headers=headers,
                 body_kind=body_kind,
                 body_length=body_length,
+                request_method=current.request_method,
             )
             state = ParserState.DECISION
 
@@ -725,9 +904,20 @@ def parse_http_1_1_responses(stream, on_headers, on_body):
                 continue
 
             if current.body_kind is BodyKind.NONE:
+                is_tunnel = (
+                    current.request_method == u"CONNECT"
+                    and 200 <= current.status_code < 300
+                )
+                is_switch = current.status_code == 101
+                if current.status_code >= 200:
+                    request_index += 1
                 current = None
                 body_reader = None
-                state = ParserState.STATUS_LINE
+                state = (
+                    ParserState.DONE
+                    if is_tunnel or is_switch
+                    else ParserState.STATUS_LINE
+                )
                 continue
 
             body_reader = make_body_reader(
@@ -746,6 +936,7 @@ def parse_http_1_1_responses(stream, on_headers, on_body):
                 raise BodyNotConsumedError(
                     "on_body() returned before the response body was fully consumed"
                 )
+            request_index += 1
             current = None
             body_reader = None
             state = ParserState.STATUS_LINE
@@ -753,6 +944,7 @@ def parse_http_1_1_responses(stream, on_headers, on_body):
         elif state is ParserState.BODY_DISCARD:
             assert body_reader is not None
             drain_body(body_reader)
+            request_index += 1
             current = None
             body_reader = None
             state = ParserState.STATUS_LINE
